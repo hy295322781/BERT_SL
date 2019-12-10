@@ -12,5 +12,5 @@ python BERT_SL.py \
 --max_seq_length=128 \
 --train_batch_size=32 \
 --learning_rate=2e-5 \
---num_train_epochs=7.0 \
+--num_train_epochs=10.0 \
 --output_dir=./output
