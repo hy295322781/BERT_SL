@@ -13,7 +13,7 @@ from absl import flags, logging
 from bert import modeling
 from bert import optimization
 from bert import tokenization
-from metrics import evaluate
+from metrics import evaluate,extract_slot,convert_slot
 import tensorflow as tf
 
 FLAGS = flags.FLAGS
@@ -117,6 +117,141 @@ flags.DEFINE_integer(
 
 flags.DEFINE_string("middle_output", "data", "Dir was used to store middle data!")
 flags.DEFINE_string("crf", "True", "use crf!")
+
+class Estimator():
+    def __init__(self):
+        self.set_variable()
+        self.set_estimator()
+        self.closed = False
+        self.first_run = True
+
+    def _create_generator(self):
+        while not self.closed:
+            for feature in self.next_features:
+                yield feature
+
+    def make_input_fn(self,generator,max_seq_len):
+        def input_fn(params):
+            _ = params["batch_size"]
+            ds = tf.data.Dataset().from_generator(generator,output_types={
+                "input_ids":tf.int64,
+                "mask": tf.int64,
+                "segment_ids": tf.int64,
+                "label_ids": tf.int64
+            },output_shapes={
+                "input_ids": [max_seq_len],
+                "mask": [max_seq_len],
+                "segment_ids": [max_seq_len],
+                "label_ids": [max_seq_len]
+            }).batch(1)
+            return ds
+        return input_fn
+
+    def set_variable(self):
+        processors = {"ner": NerProcessor, "atis": AtisProcessor, "msds": MSDSProcessor}
+        task_name = FLAGS.task_name.lower()
+        if task_name not in processors:
+            raise ValueError("Task not found: %s" % (task_name))
+        self.processor = processors[task_name]()
+        self.label_list = self.processor.get_labels()
+        self.tokenizer = tokenization.FullTokenizer(
+            vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
+        with open(FLAGS.middle_output + '/label2id.pkl', 'rb') as rf:
+            label2id = pickle.load(rf)
+            self.id2label = {value: key for key, value in label2id.items()}
+
+    def set_estimator(self):
+        logging.set_verbosity(logging.INFO)
+        processors = {"ner": NerProcessor, "atis": AtisProcessor, "msds": MSDSProcessor}
+        bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+        if FLAGS.max_seq_length > bert_config.max_position_embeddings:
+            raise ValueError(
+                "Cannot use sequence length %d because the BERT model "
+                "was only trained up to sequence length %d" %
+                (FLAGS.max_seq_length, bert_config.max_position_embeddings))
+
+        task_name = FLAGS.task_name.lower()
+        if task_name not in processors:
+            raise ValueError("Task not found: %s" % (task_name))
+        processor = processors[task_name]()
+        label_list = processor.get_labels()
+
+        tpu_cluster_resolver = None
+        if FLAGS.use_tpu and FLAGS.tpu_name:
+            tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
+                FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
+        is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
+        run_config = tf.contrib.tpu.RunConfig(
+            cluster=tpu_cluster_resolver,
+            master=FLAGS.master,
+            model_dir=FLAGS.output_dir,
+            save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+            tpu_config=tf.contrib.tpu.TPUConfig(
+                iterations_per_loop=FLAGS.iterations_per_loop,
+                num_shards=FLAGS.num_tpu_cores,
+                per_host_input_for_training=is_per_host))
+        model_fn = model_fn_builder(
+            bert_config=bert_config,
+            num_labels=len(label_list),
+            init_checkpoint=FLAGS.init_checkpoint,
+            learning_rate=FLAGS.learning_rate,
+            num_train_steps=None,
+            num_warmup_steps=None,
+            use_tpu=FLAGS.use_tpu,
+            use_one_hot_embeddings=FLAGS.use_tpu)
+        self.estimator = tf.contrib.tpu.TPUEstimator(
+            use_tpu=FLAGS.use_tpu,
+            model_fn=model_fn,
+            config=run_config,
+            train_batch_size=FLAGS.train_batch_size,
+            eval_batch_size=FLAGS.eval_batch_size,
+            predict_batch_size=FLAGS.predict_batch_size)
+
+    def convert_example(self,examples):
+        records = list()
+        tokens = list()
+        for (ex_index, example) in enumerate(examples):
+            if ex_index % 5000 == 0:
+                logging.info("Writing example %d of %d" % (ex_index, len(examples)))
+            feature, ntokens, label_ids = convert_single_example(ex_index, example, self.label_list, FLAGS.max_seq_length,
+                                                                 self.tokenizer,"predict")
+            features = {}
+            features["input_ids"] = feature.input_ids
+            features["mask"] = feature.mask
+            features["segment_ids"] = feature.segment_ids
+            features["label_ids"] = feature.label_ids
+            records.append(features)
+            tokens.append(ntokens)
+        return records,tokens
+
+    def output_label(self,labels,tokens):
+        line_predict = list()
+        for index, t in enumerate(tokens):
+            if t != "[PAD]" and t != "[CLS]":
+                if labels[index] != "X":
+                    line_predict.append(labels[index])
+        return line_predict
+
+    def predict(self,string):
+        examples = self.processor.get_predict_examples([string])
+        self.next_features,tokens = self.convert_example(examples)
+        if self.first_run:
+            input_fn = self.make_input_fn(self._create_generator,FLAGS.max_seq_length)
+            self.prediction = self.estimator.predict(input_fn=input_fn)
+            self.first_run = False
+        results = [next(self.prediction)]
+        origin_label = list(map(lambda x:self.id2label[x],results[0]))
+        label_list = self.output_label(origin_label,tokens[0])
+        slot = convert_slot(extract_slot(label_list),examples[0].text.split())
+        return slot
+
+    def close(self):
+        self.closed = True
+        try:
+            next(self.prediction)
+        except:
+            logging.info("Estimator closed.")
+
 
 
 class InputExample(object):
@@ -287,6 +422,11 @@ class MSDSProcessor(DataProcessor):
             self._read_data(os.path.join(data_dir, "test.json")), "test"
         )
 
+    def get_predict_examples(self,string_list):
+        return self._create_example(
+            self._read_string(string_list), "predict"
+        )
+
     def get_labels(self):
         """
         here "X" used to represent "##eer","##soo" and so on!
@@ -328,6 +468,17 @@ class MSDSProcessor(DataProcessor):
             word = " ".join(word_tokens)
             label = " ".join(label_tokens)
             lines.append((label, word))
+        return lines
+
+    def _read_string(self,string_list):
+        tokenizer = tokenization.BasicTokenizer(do_lower_case=True)
+        lines = list()
+        for string in string_list:
+            word_tokens = tokenizer.tokenize(string)
+            label_tokens = ["O" for _ in word_tokens]
+            word = " ".join(word_tokens)
+            label = " ".join(label_tokens)
+            lines.append((label,word))
         return lines
 
 class NerProcessor(DataProcessor):
@@ -824,12 +975,17 @@ def main(_):
         true_example_output = os.path.join(FLAGS.output_dir, "true_examples.txt")
         evaluate(output_predict_file,predict_examples,error_example_output,true_example_output,distinct=True)
 
+def predict(_):
+    e = Estimator()
+    while True:
+        slot = e.predict(input(">>"))
+        print(slot)
 
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     flags.mark_flag_as_required("data_dir")
     flags.mark_flag_as_required("task_name")
     flags.mark_flag_as_required("vocab_file")
     flags.mark_flag_as_required("bert_config_file")
     flags.mark_flag_as_required("output_dir")
-    tf.app.run()
+    tf.app.run(predict)

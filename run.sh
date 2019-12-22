@@ -1,8 +1,8 @@
 python BERT_SL.py \
 --task_name="MSDS" \
 --do_lower_case=True \
---crf=True \
---do_train=True \
+--crf=False \
+--do_train=False \
 --do_eval=False \
 --do_predict=True \
 --data_dir=data \
